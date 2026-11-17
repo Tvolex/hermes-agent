@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -11,6 +12,7 @@ from hermes_cli.version_info import (
     _git_version_info,
     _reset_version_info_cache,
     _resolve_stamp_file,
+    _run_git,
     _stamp_version_info,
     get_version_info,
 )
@@ -300,3 +302,73 @@ def test_a_timed_out_status_probe_never_strands_index_lock(tmp_path):
     _git_version_info(tmp_path, include_untracked=True)
 
     assert not (tmp_path / ".git" / "index.lock").exists()
+
+
+# ── _run_git: the probe must be bounded ──────────────────────────────────────
+#
+# `_run_git` used `subprocess.run(..., timeout=3)`. On Windows that is not a bound: run()'s
+# post-timeout path kills the direct child and then re-reads the captured pipes with an
+# *unbounded* communicate(), so a descendant holding duplicated pipe handles blocks forever.
+# `_stamp_version_info` reaches this while an agent builds its first API request
+# (nous_portal_tags -> hermes_client_tag -> get_version_info), so a fresh managed worker wedged
+# before its first model call until the turn-liveness watchdog fired and the Kanban card was
+# reclaimed as stale ~1h later (#68609 / #66037).
+
+def test_run_git_delegates_to_the_bounded_probe(monkeypatch):
+    """The bound must come from bounded_probe_run; a plain subprocess.run(timeout=) is not one."""
+    seen = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "  deadbeef  \n"
+
+    def _probe(argv, *, timeout, cwd):
+        seen.update(argv=argv, timeout=timeout, cwd=cwd)
+        return _Result()
+
+    monkeypatch.setattr("hermes_cli.version_info.bounded_probe_run", _probe)
+
+    repo = Path("/repo")
+    assert _run_git(repo, "rev-parse", "HEAD") == "deadbeef"
+    assert seen == {"argv": ["git", "rev-parse", "HEAD"], "timeout": 3, "cwd": str(repo)}
+
+
+def test_run_git_returns_a_real_checkout_commit():
+    """End to end with real git: the bounded probe still returns git's own answer."""
+    repo = Path(__file__).resolve().parents[2]
+    if not (repo / ".git").exists():
+        pytest.skip("not a git checkout")
+    commit = _run_git(repo, "rev-parse", "HEAD")
+    assert commit and len(commit) == 40
+
+
+def test_run_git_none_when_git_rejects_the_ref(tmp_path):
+    """A failing git (an unborn branch here) maps to None, as before."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    assert _run_git(tmp_path, "rev-parse", "HEAD") is None
+
+
+@pytest.mark.platforms("posix")  # process-group + pipe-handle inheritance semantics
+def test_run_git_bounds_a_child_whose_descendant_holds_the_pipes(tmp_path, monkeypatch):
+    """Real subprocess, no mocks: a `git` that forks a long-lived descendant and stalls.
+
+    The descendant inherits the captured pipe write ends, so a killed direct child never reaches
+    EOF — the exact shape that hung a turn. The pre-fix ``subprocess.run(timeout=3)`` blocks in
+    run()'s post-kill communicate(); this asserts the bound holds instead.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 300 &\n"          # inherits stdout/stderr: keeps the pipes open after the kill
+        "sleep 300\n"
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    start = time.monotonic()
+    assert _run_git(tmp_path, "rev-parse", "HEAD") is None
+    # 3s timeout + tree-kill + 1s bounded drain + slack; the pre-fix failure mode is an
+    # indefinite hang, so any finite bound proves the property.
+    assert time.monotonic() - start < 30
